@@ -106,14 +106,20 @@ fi
 TEMPLATE_STORAGE="$(pvesm status --content vztmpl | awk 'NR > 1 {print $1; exit}')"
 [[ -n "$TEMPLATE_STORAGE" ]] || die "Kein Storage für LXC-Templates gefunden."
 
-# Debian-13-Template suchen/herunterladen
+# Debian-13-Template passend zur Host-Architektur suchen
 msg "Aktualisiere Template-Liste"
 pveam update
 
+HOST_ARCH="$(dpkg --print-architecture)"
+[[ "$HOST_ARCH" == "amd64" ]] ||
+    die "Dieser Setup-Abschnitt erwartet einen amd64-Proxmox-Host; erkannt: ${HOST_ARCH}"
+
 TEMPLATE="$(pveam available --section system \
-    | awk '$2 ~ /^debian-13-standard_/ {print $2}' \
+    | awk '$2 ~ /^debian-13-standard_/ && $3 == "amd64" {print $2}' \
     | sort -V | tail -n 1)"
-[[ -n "$TEMPLATE" ]] || die "Debian-13-Standard-Template nicht gefunden."
+
+[[ -n "$TEMPLATE" ]] ||
+    die "Kein Debian-13-Standard-Template für amd64 gefunden."
 
 msg "Lade Template ${TEMPLATE}"
 pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
@@ -241,30 +247,20 @@ usermod -aG \
 "${G_VIDEO},${G_AUDIO},${G_RENDER},${G_REMOTE_KEYBOARD},${G_REMOTE_INPUT}" \
 moonfin
 
-# Neueste Linux-Debian-Datei aus dem Moonfin-Core-Release suchen.
+# Neueste x86-64-Linux-Debian-Datei aus dem Moonfin-Core-Release suchen.
 RELEASE_API="https://api.github.com/repos/Moonfin-Client/Moonfin-Core/releases/latest"
 RELEASE_JSON="$(curl -fsSL "$RELEASE_API")"
 
 DEB_URL="$(printf '%s' "$RELEASE_JSON" | jq -r '
     [.assets[]
-     | select(.name | test("\\.deb$"; "i"))
-     | select(.name | test("amd64|x86_64"; "i"))]
-    | .[0].browser_download_url // empty
+     | select(.name | test("^Moonfin_Linux_v[0-9].*\\.deb$"; "i"))]
+    | if length == 1 then .[0].browser_download_url
+      else empty
+      end
 ')"
 
-# Wenn der Assetname keine Architektur enthält, nur dann eine .deb-Datei
-# verwenden, wenn das Release genau eine .deb-Datei anbietet.
-if [[ -z "$DEB_URL" ]]; then
-    DEB_COUNT="$(printf '%s' "$RELEASE_JSON" | jq '[.assets[] | select(.name | test("\\.deb$"; "i"))] | length')"
-    if [[ "$DEB_COUNT" == "1" ]]; then
-        DEB_URL="$(printf '%s' "$RELEASE_JSON" | jq -r '
-            [.assets[] | select(.name | test("\\.deb$"; "i"))][0].browser_download_url
-        ')"
-    fi
-fi
-
 if [[ -z "$DEB_URL" || "$DEB_URL" == "null" ]]; then
-    echo "Kein eindeutiges Moonfin-Linux-.deb im neuesten Release gefunden."
+    echo "Kein eindeutiges x86-64 Moonfin-DEB im neuesten Release gefunden."
     echo "Release: $RELEASE_API"
     exit 1
 fi
