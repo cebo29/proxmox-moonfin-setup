@@ -1,367 +1,403 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+trap 'report_error' ERR
+IFS=$'\n\t'
 
-# Moonfin-Kiosk-LXC für Proxmox VE
-# Als root auf dem Proxmox-Host starten.
-#
-# Standard:
-#   2 CPU-Kerne, 2048 MB RAM, 512 MB Swap, 10 GB Disk
-#
-# GID-Zuordnungen:
-#   Host 39  -> Container 44   (card1/video)
-#   Host 63  -> Container 63   (Audio)
-#   Host 993 -> Container 108  (renderD128/render)
-#   Host 104 -> Container 2000 (Bluetooth)
-#   Host 997 -> Container 2001 (zusätzliche Eingabegruppe)
+VERSION="0.6.0"
 
-die() { echo "FEHLER: $*" >&2; exit 1; }
-msg() { echo; echo "==> $*"; }
+DEFAULT_HOSTNAME="moonfin"
+DEFAULT_CORES=2
+DEFAULT_MEMORY=2048
+DEFAULT_SWAP=512
+DEFAULT_DISK=10
+PREFERRED_TEMPLATE_STORAGE="local"
+PREFERRED_ROOT_STORAGE="pve-data"
+PREFERRED_BRIDGE="vmbr0"
 
-[[ "$(id -u)" -eq 0 ]] || die "Bitte als root auf dem Proxmox-Host starten."
-command -v pct >/dev/null || die "pct wurde nicht gefunden."
-command -v pvesh >/dev/null || die "pvesh wurde nicht gefunden."
-command -v pveam >/dev/null || die "pveam wurde nicht gefunden."
-command -v jq >/dev/null || die "jq fehlt auf dem Proxmox-Host. Installiere es mit: apt install jq"
+die() {
+    whiptail --title "Moonfin Helper – Fehler" \
+        --msgbox "$1" 12 76 || true
+    exit 1
+}
 
-# ---------- Standardwerte ----------
-CT_HOSTNAME="moonfin"
-CORES="2"
-MEMORY="2048"
-SWAP="512"
-DISK_GB="10"
-BRIDGE="vmbr0"
-# ---------------------------------
+report_error() {
+    local exit_code=$?
+    local line="${BASH_LINENO[0]:-unbekannt}"
 
-echo
-echo "Moonfin-LXC einrichten"
-echo "  1) Standardeinstellungen"
-echo "  2) Einstellungen manuell eingeben"
-echo
-read -r -p "Auswahl [1]: " SETUP_MODE
-SETUP_MODE="${SETUP_MODE:-1}"
+    trap - ERR
 
-case "$SETUP_MODE" in
-    1)
-        echo "Verwende Standardeinstellungen."
-        ;;
-    2)
-        read -r -p "Hostname [${CT_HOSTNAME}]: " INPUT
-        CT_HOSTNAME="${INPUT:-$CT_HOSTNAME}"
+    echo "FEHLER: Skript abgebrochen (Exit-Code ${exit_code}, Zeile ${line})." >&2
+    echo "Bitte CT-Konfiguration und Storage prüfen, bevor du erneut startest." >&2
 
-        read -r -p "CPU-Kerne [${CORES}]: " INPUT
-        CORES="${INPUT:-$CORES}"
+    exit "$exit_code"
+}
 
-        read -r -p "RAM in MB [${MEMORY}]: " INPUT
-        MEMORY="${INPUT:-$MEMORY}"
+command -v whiptail >/dev/null 2>&1 || {
+    echo "whiptail fehlt. Installiere es mit: apt-get update && apt-get install -y whiptail"
+    exit 1
+}
 
-        read -r -p "Swap in MB [${SWAP}]: " INPUT
-        SWAP="${INPUT:-$SWAP}"
+[[ $EUID -eq 0 ]] || {
+    echo "Bitte als root auf dem Proxmox-Host ausführen."
+    exit 1
+}
 
-        read -r -p "Root-Disk in GB [${DISK_GB}]: " INPUT
-        DISK_GB="${INPUT:-$DISK_GB}"
+[[ -d /etc/pve/lxc ]] || {
+    echo "Dieses Skript muss auf einem Proxmox-VE-Host laufen."
+    exit 1
+}
 
-        read -r -p "Netzwerk-Bridge [${BRIDGE}]: " INPUT
-        BRIDGE="${INPUT:-$BRIDGE}"
-        ;;
-    *)
-        die "Ungültige Auswahl."
-        ;;
-esac
+# Liefert aktive Storages für den verlangten Inhaltstyp.
+get_storages() {
+    local content="$1"
+    pvesm status -content "$content" |
+        awk 'NR > 1 && $3 == "active" {print $1}'
+}
 
-[[ "$CORES" =~ ^[1-9][0-9]*$ ]] || die "CPU-Kerne müssen eine positive ganze Zahl sein."
-[[ "$MEMORY" =~ ^[1-9][0-9]*$ ]] || die "RAM muss eine positive ganze Zahl sein."
-[[ "$SWAP" =~ ^[0-9]+$ ]] || die "Swap muss eine ganze Zahl sein."
-[[ "$DISK_GB" =~ ^[1-9][0-9]*$ ]] || die "Disk-Größe muss eine positive ganze Zahl sein."
-[[ "$CT_HOSTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]] || die "Hostname ist ungültig."
-[[ -e "/sys/class/net/${BRIDGE}" ]] || die "Bridge ${BRIDGE} existiert nicht."
+# Wählt einen geeigneten Storage aus.
+# Bevorzugten Storage verwenden, wenn er tatsächlich geeignet ist.
+select_storage() {
+    local content="$1"
+    local title="$2"
+    local preferred="$3"
+    local storage details selected default_storage=""
+    local -a menu=()
+    local -a storages=()
 
-echo
-echo "Einstellungen:"
-echo "  Hostname: ${CT_HOSTNAME}"
-echo "  CPU:      ${CORES} Kerne"
-echo "  RAM:      ${MEMORY} MB"
-echo "  Swap:     ${SWAP} MB"
-echo "  Disk:     ${DISK_GB} GB"
-echo "  Bridge:   ${BRIDGE}"
-echo "  DNS:      Werte vom Proxmox-Host"
-echo
-read -r -p "Container erstellen und einrichten? [J/n]: " CONFIRM
-CONFIRM="${CONFIRM:-J}"
-[[ "$CONFIRM" =~ ^[JjYy]$ ]] || die "Abgebrochen."
+    mapfile -t storages < <(get_storages "$content")
 
-# Nächste freie CT-ID
-CTID="$(pvesh get /cluster/nextid)"
-[[ "$CTID" =~ ^[0-9]+$ ]] || die "Konnte keine freie CT-ID ermitteln."
+    ((${#storages[@]} > 0)) ||
+        die "Kein aktiver Storage unterstützt '$content'."
 
-# Rootfs-Storage ermitteln
-ROOTFS_STORAGE=""
-if pvesm status --content rootdir | awk 'NR > 1 {print $1}' | grep -qx "local-lvm"; then
-    ROOTFS_STORAGE="local-lvm"
+    for storage in "${storages[@]}"; do
+        if [[ "$storage" == "$preferred" ]]; then
+            default_storage="$storage"
+            break
+        fi
+    done
+
+    # Falls der bevorzugte Storage fehlt, den ersten geeigneten nehmen.
+    [[ -n "$default_storage" ]] || default_storage="${storages[0]}"
+
+    for storage in "${storages[@]}"; do
+        details="$(pvesm status |
+            awk -v s="$storage" '
+                NR > 1 && $1 == s {
+                    gib = $6 / 1048576
+                    printf "%s – %.1f GiB frei", $2, gib
+                }
+            ')"
+        local state="OFF"
+        [[ "$storage" == "$default_storage" ]] && state="ON"
+
+        menu+=("$storage" "${details:-Storage}" "$state")
+    done
+
+    selected="$(whiptail \
+        --title "$title" \
+        --radiolist "Bitte einen geeigneten Storage auswählen:" \
+        18 78 8 "${menu[@]}" \
+        3>&1 1>&2 2>&3)" || exit 0
+
+    [[ -n "$selected" ]] || die "Kein Storage ausgewählt."
+    printf '%s' "$selected"
+}
+
+# Ermittelt vorhandene Linux-Bridge-Interfaces.
+get_bridges() {
+    ip -o link show type bridge |
+        awk -F': ' '{print $2}' |
+        sed 's/@.*//' |
+        grep -Ev '^(fwbr|fwpr|fwln)[0-9]' |
+        sort -u
+}
+
+select_bridge() {
+    local preferred="$1"
+    local bridge selected default_bridge=""
+    local -a bridges=()
+    local -a menu=()
+
+    mapfile -t bridges < <(get_bridges)
+
+    ((${#bridges[@]} > 0)) ||
+        die "Keine vorhandene Linux-Bridge gefunden. Bitte zuerst eine Bridge auf Proxmox konfigurieren."
+
+    for bridge in "${bridges[@]}"; do
+        if [[ "$bridge" == "$preferred" ]]; then
+            default_bridge="$bridge"
+            break
+        fi
+    done
+
+    [[ -n "$default_bridge" ]] || default_bridge="${bridges[0]}"
+
+    for bridge in "${bridges[@]}"; do
+        local state="OFF"
+        [[ "$bridge" == "$default_bridge" ]] && state="ON"
+        menu+=("$bridge" "Linux-Bridge" "$state")
+    done
+
+    selected="$(whiptail \
+        --title "Netzwerk-Bridge" \
+        --radiolist "Bridge für den Moonfin-Container:" \
+        15 72 6 "${menu[@]}" \
+        3>&1 1>&2 2>&3)" || exit 0
+
+    [[ -n "$selected" ]] || die "Keine Netzwerk-Bridge ausgewählt."
+    printf '%s' "$selected"
+}
+
+whiptail --title "Moonfin LXC Helper v${VERSION}" \
+    --msgbox "Dieser Assistent erstellt einen unprivilegierten Debian-13-LXC als Grundlage für Moonfin.
+
+Standardwerte:
+CPU: 2 Kerne
+RAM: 2048 MB
+Swap: 512 MB
+Root-Disk: 10 GB
+
+Storage und Netzwerk werden auf diesem Proxmox-Host erkannt.
+
+Der Container wird in diesem Schritt erstellt, aber noch nicht gestartet. Moonfin, HDMI und Xorg werden später eingerichtet." 18 76
+
+if whiptail --title "Konfiguration" \
+    --yesno "Möchtest du die Standardwerte verwenden?
+
+Nein öffnet die erweiterten Einstellungen." 10 72; then
+    HOSTNAME="$DEFAULT_HOSTNAME"
+    CORES="$DEFAULT_CORES"
+    MEMORY="$DEFAULT_MEMORY"
+    SWAP="$DEFAULT_SWAP"
+    DISK="$DEFAULT_DISK"
 else
-    ROOTFS_STORAGE="$(pvesm status --content rootdir | awk 'NR > 1 {print $1; exit}')"
+    HOSTNAME="$(whiptail --title "Hostname" \
+        --inputbox "Hostname des Containers:" 10 70 \
+        "$DEFAULT_HOSTNAME" 3>&1 1>&2 2>&3)" || exit 0
+
+    CORES="$(whiptail --title "CPU" \
+        --inputbox "Anzahl CPU-Kerne:" 10 70 \
+        "$DEFAULT_CORES" 3>&1 1>&2 2>&3)" || exit 0
+
+    MEMORY="$(whiptail --title "Arbeitsspeicher" \
+        --inputbox "RAM in MB:" 10 70 \
+        "$DEFAULT_MEMORY" 3>&1 1>&2 2>&3)" || exit 0
+
+    SWAP="$(whiptail --title "Swap" \
+        --inputbox "Swap in MB:" 10 70 \
+        "$DEFAULT_SWAP" 3>&1 1>&2 2>&3)" || exit 0
+
+    DISK="$(whiptail --title "Root-Disk" \
+        --inputbox "Root-Disk in GB:" 10 70 \
+        "$DEFAULT_DISK" 3>&1 1>&2 2>&3)" || exit 0
 fi
-[[ -n "$ROOTFS_STORAGE" ]] || die "Kein Storage für Container-Rootfs gefunden."
 
-# Template-Storage ermitteln
-TEMPLATE_STORAGE="$(pvesm status --content vztmpl | awk 'NR > 1 {print $1; exit}')"
-[[ -n "$TEMPLATE_STORAGE" ]] || die "Kein Storage für LXC-Templates gefunden."
+[[ "$HOSTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]] ||
+    die "Ungültiger Hostname."
 
-# Debian-13-Template passend zur Host-Architektur suchen
-msg "Aktualisiere Template-Liste"
-pveam update
+[[ "$CORES" =~ ^[1-9][0-9]*$ ]] ||
+    die "CPU-Kerne müssen eine positive ganze Zahl sein."
 
-HOST_ARCH="$(dpkg --print-architecture)"
-[[ "$HOST_ARCH" == "amd64" ]] ||
-    die "Dieser Setup-Abschnitt erwartet einen amd64-Proxmox-Host; erkannt: ${HOST_ARCH}"
+[[ "$MEMORY" =~ ^[1-9][0-9]*$ ]] ||
+    die "RAM muss eine positive ganze Zahl sein."
 
-TEMPLATE="$(pveam available --section system \
-    | awk '$2 ~ /^debian-13-standard_/ && $3 == "amd64" {print $2}' \
-    | sort -V | tail -n 1)"
+[[ "$SWAP" =~ ^[0-9]+$ ]] ||
+    die "Swap muss eine nichtnegative ganze Zahl sein."
+
+[[ "$DISK" =~ ^[1-9][0-9]*$ ]] ||
+    die "Disk-Größe muss eine positive ganze Zahl sein."
+
+TEMPLATE_STORAGE="$(
+    select_storage vztmpl "Debian-Template-Storage" \
+        "$PREFERRED_TEMPLATE_STORAGE"
+)"
+
+ROOT_STORAGE="$(
+    select_storage rootdir "Container-Rootfs-Storage" \
+        "$PREFERRED_ROOT_STORAGE"
+)"
+
+BRIDGE="$(select_bridge "$PREFERRED_BRIDGE")"
+
+whiptail --title "Debian-Template" \
+    --infobox "Aktualisiere die Proxmox-Template-Liste ..." 8 65
+
+pveam update ||
+    die "Die Proxmox-Template-Liste konnte nicht aktualisiert werden."
+
+TEMPLATE="$(
+    pveam available --section system |
+        awk '$2 ~ /^debian-13-standard_.*_amd64\.tar\.zst$/ {print $2}' |
+        sort -V |
+        tail -n 1
+)"
 
 [[ -n "$TEMPLATE" ]] ||
-    die "Kein Debian-13-Standard-Template für amd64 gefunden."
+    die "Kein Debian-13-amd64-Standardtemplate gefunden."
 
-msg "Lade Template ${TEMPLATE}"
-pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
+TEMPLATE_VOLID="${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}"
 
-# Sub-GID-Berechtigungen für die Sonder-GIDs ergänzen
-for gid in 39 63 104 993 997; do
-    grep -qxF "root:${gid}:1" /etc/subgid 2>/dev/null ||
-        echo "root:${gid}:1" >> /etc/subgid
-done
+# Prüfen, ob der Template-Storage aktiv ist.
+if ! pvesm status -content vztmpl |
+    awk -v s="$TEMPLATE_STORAGE" \
+        'NR > 1 && $1 == s && $3 == "active" {found=1} END {exit !found}'; then
+    die "Template-Storage '$TEMPLATE_STORAGE' ist nicht mehr aktiv."
+fi
 
-msg "Erstelle unprivilegierten Container ${CTID}"
+# Freien Speicherplatz des Template-Storages prüfen.
+TEMPLATE_FREE_KIB="$(
+    pvesm status |
+        awk -v s="$TEMPLATE_STORAGE" \
+            'NR > 1 && $1 == s {print $6}'
+)"
 
-# Absichtlich keine --nameserver- und --searchdomain-Option:
-# Proxmox soll die Host-DNS- und Suchdomain-Einstellungen übernehmen.
-pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" \
-    --hostname "$CT_HOSTNAME" \
-    --unprivileged 1 \
+[[ "$TEMPLATE_FREE_KIB" =~ ^[0-9]+$ ]] ||
+    die "Der freie Speicherplatz von '$TEMPLATE_STORAGE' konnte nicht ermittelt werden."
+
+# Das Template benötigt derzeit etwa 130 MB; 512 MiB Reserve einplanen.
+TEMPLATE_REQUIRED_KIB=$((512 * 1024))
+
+if ! pvesm list "$TEMPLATE_STORAGE" --content vztmpl |
+    awk -v wanted="$TEMPLATE_VOLID" '$1 == wanted {found=1} END {exit !found}'; then
+    if (( TEMPLATE_FREE_KIB < TEMPLATE_REQUIRED_KIB )); then
+        die "Auf '$TEMPLATE_STORAGE' ist zu wenig freier Speicherplatz für den Template-Download vorhanden."
+    fi
+fi
+
+# Nächste freie CT-ID ermitteln.
+CTID="$(pvesh get /cluster/nextid)" ||
+    die "Die nächste freie CT-ID konnte nicht ermittelt werden."
+
+[[ "$CTID" =~ ^[0-9]+$ ]] ||
+    die "Proxmox lieferte eine ungültige CT-ID."
+
+# Noch keine Änderungen an Template oder Container vornehmen.
+if ! whiptail --title "Zusammenfassung" \
+    --yesno "Bitte Einstellungen prüfen:
+
+CT-ID: $CTID
+Hostname: $HOSTNAME
+Template: $TEMPLATE
+Template-Storage: $TEMPLATE_STORAGE
+Rootfs-Storage: $ROOT_STORAGE
+CPU: $CORES Kerne
+RAM: $MEMORY MB
+Swap: $SWAP MB
+Root-Disk: $DISK GB
+Bridge: $BRIDGE
+Unprivilegiert: Ja
+Autostart: Nein
+
+Bei Bestätigung wird bei Bedarf das Template heruntergeladen und der Container erstellt." \
+    22 78; then
+    exit 0
+fi
+
+# Prüfen, ob das gewählte Template bereits im Ziel-Storage vorhanden ist.
+if ! pvesm list "$TEMPLATE_STORAGE" --content vztmpl |
+    awk -v wanted="$TEMPLATE_VOLID" \
+        '$1 == wanted {found=1} END {exit !found}'
+then
+    if ! whiptail --title "Template herunterladen" \
+        --yesno "Das ausgewählte Template fehlt im Storage '$TEMPLATE_STORAGE'.
+
+Template:
+$TEMPLATE
+
+Jetzt herunterladen?" 13 76; then
+        exit 0
+    fi
+
+    pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" ||
+        die "Der Template-Download ist fehlgeschlagen."
+fi
+
+# CT-ID unmittelbar vor der Erstellung erneut ermitteln.
+NEW_CTID="$(pvesh get /cluster/nextid)" ||
+    die "Die freie CT-ID konnte nicht erneut ermittelt werden."
+
+[[ "$NEW_CTID" =~ ^[0-9]+$ ]] ||
+    die "Proxmox lieferte eine ungültige CT-ID."
+
+if [[ "$NEW_CTID" != "$CTID" ]]; then
+    if ! whiptail --title "CT-ID geändert" \
+        --yesno "Die nächste freie CT-ID hat sich geändert.
+
+Bisher: $CTID
+Jetzt: $NEW_CTID
+
+Mit der neuen ID fortfahren?" 12 72; then
+        exit 0
+    fi
+    CTID="$NEW_CTID"
+fi
+
+# Unmittelbare Prüfung vor pct create.
+if [[ -e "/etc/pve/lxc/${CTID}.conf" ]] ||
+   pct status "$CTID" >/dev/null 2>&1; then
+    die "CT-ID $CTID ist inzwischen belegt. Bitte Helper erneut starten."
+fi
+
+# Prüfen, ob das ausgewählte Rootfs-Storage aktiv ist.
+if ! pvesm status -content rootdir |
+    awk -v s="$ROOT_STORAGE" \
+        'NR > 1 && $1 == s && $3 == "active" {found=1} END {exit !found}'; then
+    die "Rootfs-Storage '$ROOT_STORAGE' ist nicht mehr aktiv."
+fi
+
+# Freien Platz des Rootfs-Storages prüfen.
+ROOT_FREE_KIB="$(
+    pvesm status |
+        awk -v s="$ROOT_STORAGE" \
+            'NR > 1 && $1 == s {print $6}'
+)"
+
+[[ "$ROOT_FREE_KIB" =~ ^[0-9]+$ ]] ||
+    die "Der freie Speicherplatz von '$ROOT_STORAGE' konnte nicht ermittelt werden."
+
+ROOT_REQUIRED_KIB=$((DISK * 1024 * 1024))
+if (( ROOT_FREE_KIB < ROOT_REQUIRED_KIB )); then
+    die "Auf '$ROOT_STORAGE' ist nicht genug freier Speicherplatz für die ausgewählte Root-Disk von ${DISK} GB verfügbar."
+fi
+
+whiptail --title "Container-Erstellung" \
+    --infobox "Erstelle den unprivilegierten Debian-Container CT $CTID ..." 8 70
+
+pct create "$CTID" "$TEMPLATE_VOLID" \
+    --hostname "$HOSTNAME" \
+    --arch amd64 \
+    --ostype debian \
     --cores "$CORES" \
     --memory "$MEMORY" \
     --swap "$SWAP" \
-    --rootfs "${ROOTFS_STORAGE}:${DISK_GB}" \
-    --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=auto" \
-    --onboot 1 \
-    --start 0 \
-    --features nesting=1
+    --rootfs "${ROOT_STORAGE}:${DISK}" \
+    --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=dhcp,type=veth" \
+      --features nesting=1 \
+    --unprivileged 1 \
+    --onboot 0 ||
+    die "Die Erstellung von CT $CTID ist fehlgeschlagen."
 
-CONF="/etc/pve/lxc/${CTID}.conf"
-
-# HDMI, DRM, Audio, Eingabegeräte und VT.
-# Die begrenzten Device-Freigaben ersetzen keine Host-Desktop-Sitzung.
-cat >> "$CONF" <<'LXC_CONFIG'
-
-# GPU/HDMI, Audio, Eingabe und VT7
-lxc.cgroup2.devices.allow: c 13:* rwm
-lxc.cgroup2.devices.allow: c 4:7 rwm
-lxc.cgroup2.devices.allow: c 116:* rwm
-lxc.cgroup2.devices.allow: c 226:* rwm
-lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir
-lxc.mount.entry: /dev/snd dev/snd none bind,optional,create=dir
-lxc.mount.entry: /dev/input dev/input none bind,optional,create=dir
-lxc.mount.entry: /dev/tty7 dev/tty7 none bind,optional,create=file
-
-# UID-Standardmapping
-lxc.idmap: u 0 100000 65536
-
-# GID-Mapping mit den Geräte-GIDs des Proxmox-Hosts:
-# Container 44   -> Host 39
-# Container 63   -> Host 63
-# Container 108  -> Host 993
-# Container 2000 -> Host 104
-# Container 2001 -> Host 997
-lxc.idmap: g 0 100000 39
-lxc.idmap: g 39 100039 5
-lxc.idmap: g 44 39 1
-lxc.idmap: g 45 100045 18
-lxc.idmap: g 63 63 1
-lxc.idmap: g 64 100064 44
-lxc.idmap: g 108 993 1
-lxc.idmap: g 109 100109 1891
-lxc.idmap: g 2000 104 1
-lxc.idmap: g 2001 997 1
-lxc.idmap: g 2002 102002 63534
-LXC_CONFIG
-
-msg "Starte Container"
-pct start "$CTID"
-
-for _ in $(seq 1 60); do
-    pct exec "$CTID" -- true >/dev/null 2>&1 && break
-    sleep 2
-done
-pct exec "$CTID" -- true >/dev/null 2>&1 ||
-    die "Container ist nicht erreichbar. Prüfe: pct start ${CTID}"
-
-msg "Installiere Wayland-, Audio- und GPU-Abhängigkeiten"
-pct exec "$CTID" -- bash -s <<'CONTAINER_SETUP'
-set -Eeuo pipefail
-export DEBIAN_FRONTEND=noninteractive
-
-apt-get update
-apt-get install -y \
-    ca-certificates curl jq dbus \
-    cage seatd \
-    libgtk-3-0 libegl1 libgl1 libgbm1 \
-    mesa-va-drivers intel-media-va-driver vainfo \
-    alsa-utils pulseaudio pulseaudio-utils \
-    evtest
-
-# Benutzer moonfin mit UID 1000 anlegen.
-if ! id moonfin >/dev/null 2>&1; then
-    if getent passwd 1000 >/dev/null; then
-        echo "UID 1000 ist bereits belegt:"
-        getent passwd 1000
-        exit 1
-    fi
-    useradd --create-home --uid 1000 --shell /bin/bash moonfin
+# Ergebnis der Erstellung verifizieren.
+if [[ ! -e "/etc/pve/lxc/${CTID}.conf" ]]; then
+    die "pct create meldete Erfolg, aber die CT-Konfiguration fehlt."
 fi
 
-# Gruppen passend zu den durchgereichten GIDs sicherstellen.
-ensure_gid_group() {
-    gid="$1"
-    preferred="$2"
-    existing="$(getent group "$gid" | cut -d: -f1 || true)"
-
-    if [[ -n "$existing" ]]; then
-        echo "$existing"
-        return
-    fi
-
-    if getent group "$preferred" >/dev/null 2>&1; then
-        preferred="${preferred}-mapped"
-    fi
-
-    groupadd --gid "$gid" "$preferred"
-    echo "$preferred"
-}
-
-G_VIDEO="$(ensure_gid_group 44 video)"
-G_AUDIO="$(ensure_gid_group 63 audio)"
-G_RENDER="$(ensure_gid_group 108 render)"
-G_REMOTE_KEYBOARD="$(ensure_gid_group 2000 remote-keyboard)"
-G_REMOTE_INPUT="$(ensure_gid_group 2001 remote-input)"
-
-usermod -aG \
-"${G_VIDEO},${G_AUDIO},${G_RENDER},${G_REMOTE_KEYBOARD},${G_REMOTE_INPUT}" \
-moonfin
-
-# Neueste x86-64-Linux-Debian-Datei aus dem Moonfin-Core-Release suchen.
-RELEASE_API="https://api.github.com/repos/Moonfin-Client/Moonfin-Core/releases/latest"
-RELEASE_JSON="$(curl -fsSL "$RELEASE_API")"
-
-DEB_URL="$(printf '%s' "$RELEASE_JSON" | jq -r '
-    [.assets[]
-     | select(.name | test("^Moonfin_Linux_v[0-9].*\\.deb$"; "i"))]
-    | if length == 1 then .[0].browser_download_url
-      else empty
-      end
-')"
-
-if [[ -z "$DEB_URL" || "$DEB_URL" == "null" ]]; then
-    echo "Kein eindeutiges x86-64 Moonfin-DEB im neuesten Release gefunden."
-    echo "Release: $RELEASE_API"
-    exit 1
+if ! pct config "$CTID" >/dev/null 2>&1; then
+    die "Die Konfiguration von CT $CTID kann nicht gelesen werden."
 fi
 
-echo "Lade Moonfin-Paket: $DEB_URL"
-curl -fL "$DEB_URL" -o /tmp/moonfin.deb
-apt-get install -y /tmp/moonfin.deb
-rm -f /tmp/moonfin.deb
-
-# Ausführbare Moonfin-Datei finden.
-MOONFIN_BIN="$(command -v moonfin || true)"
-if [[ -z "$MOONFIN_BIN" && -x /usr/lib/moonfin/moonfin ]]; then
-    MOONFIN_BIN="/usr/lib/moonfin/moonfin"
-fi
-if [[ -z "$MOONFIN_BIN" ]]; then
-    MOONFIN_BIN="$(find /usr/lib /opt /usr/bin \
-        -type f -executable -iname '*moonfin*' -print -quit 2>/dev/null || true)"
-fi
-[[ -n "$MOONFIN_BIN" ]] || {
-    echo "Moonfin wurde installiert, aber die ausführbare Datei wurde nicht gefunden."
-    exit 1
-}
-
-# Wrapper startet PulseAudio, wählt HDMI und startet Moonfin in Cage.
-cat > /usr/local/bin/moonfin-wayland-start <<EOF
-#!/bin/sh
-set -eu
-
-export HOME=/home/moonfin
-export XDG_RUNTIME_DIR=/run/moonfin
-export LIBVA_DRIVER_NAME=iHD
-export GDK_BACKEND=wayland
-
-pulseaudio --start --exit-idle-time=-1 || true
-
-i=0
-until pactl info >/dev/null 2>&1 || [ "\$i" -ge 15 ]; do
-    sleep 1
-    i=\$((i + 1))
-done
-
-if pactl info >/dev/null 2>&1; then
-    pactl set-card-profile \
-        alsa_card.pci-0000_00_1f.3 output:hdmi-stereo || true
-    pactl set-default-sink \
-        alsa_output.pci-0000_00_1f.3.hdmi-stereo || true
+if pct status "$CTID" 2>/dev/null | grep -q 'status: running'; then
+    die "CT $CTID läuft unerwartet. Bitte Zustand prüfen."
 fi
 
-exec cage -- "${MOONFIN_BIN}" \
-    >>/home/moonfin/moonfin-console.log 2>&1
-EOF
+whiptail --title "Basis-Container erstellt" \
+    --msgbox "Der Debian-13-Basiscontainer wurde erstellt.
 
-chmod 0755 /usr/local/bin/moonfin-wayland-start
-chown root:root /usr/local/bin/moonfin-wayland-start
+CT-ID: $CTID
+Hostname: $HOSTNAME
+Template-Storage: $TEMPLATE_STORAGE
+Rootfs-Storage: $ROOT_STORAGE
+Bridge: $BRIDGE
 
-# Kiosk-Service auf VT7.
-cat > /etc/systemd/system/moonfin-kiosk.service <<EOF
-[Unit]
-Description=Moonfin Wayland kiosk on HDMI
-After=systemd-user-sessions.service sound.target
-Wants=sound.target
-
-[Service]
-User=moonfin
-Group=moonfin
-SupplementaryGroups=${G_VIDEO} ${G_AUDIO} ${G_RENDER} ${G_REMOTE_KEYBOARD} ${G_REMOTE_INPUT}
-Environment=LIBSEAT_BACKEND=seatd
-Environment=LIBVA_DRIVER_NAME=iHD
-RuntimeDirectory=moonfin
-RuntimeDirectoryMode=0700
-TTYPath=/dev/tty7
-TTYReset=yes
-TTYVHangup=yes
-TTYVTDisallocate=no
-StandardInput=tty
-Restart=on-failure
-RestartSec=3
-PAMName=login
-ExecStart=/usr/local/bin/moonfin-wayland-start
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl enable seatd.service
-systemctl enable moonfin-kiosk.service
-
-chown -R moonfin:moonfin /home/moonfin
-CONTAINER_SETUP
-
-msg "Starte Moonfin-Kiosk"
-pct exec "$CTID" -- systemctl start moonfin-kiosk.service || true
-
-echo
-echo "Container ${CTID} wurde erstellt."
-echo "DNS und Suchdomain: Proxmox-Host-Einstellungen"
-echo "Ressourcen: ${CORES} CPU, ${MEMORY} MB RAM, ${SWAP} MB Swap, ${DISK_GB} GB Disk"
-echo
-echo "Status:"
-echo "  pct status ${CTID}"
-echo "  pct exec ${CTID} -- systemctl status moonfin-kiosk.service"
-echo
-echo "Moonfin-Log:"
-echo "  pct exec ${CTID} -- tail -n 200 /home/moonfin/moonfin-console.log"
+Der Container ist noch ausgeschaltet.
+Autostart nach Proxmox-Neustart ist deaktiviert.
